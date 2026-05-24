@@ -47,6 +47,21 @@
     '[role="radio"]',
     '[role="checkbox"]'
   ].join(",");
+  const MANUAL_UPLOAD_SELECTOR = [
+    'input[type="file"]',
+    "button",
+    "label",
+    "a",
+    '[role="button"]',
+    '[class*="upload"]',
+    '[class*="Upload"]',
+    '[class*="uploader"]',
+    '[class*="Uploader"]',
+    '[class*="attachment"]',
+    '[class*="Attachment"]'
+  ].join(",");
+  const MANUAL_UPLOAD_TEXT_PATTERN = /上传|附件|成绩单|证件照|照片|作品集|transcript|attachment|attach|upload|choose file|select file/i;
+  const MANUAL_UPLOAD_CLASS_PATTERN = /upload|uploader|attachment/i;
 
   const SITE_ADAPTERS = [
     {
@@ -2605,6 +2620,113 @@
     }
   }
 
+  function getManualUploadCandidateText(element, options = {}) {
+    if (!element) {
+      return "";
+    }
+
+    const includeNearby = Boolean(options.includeNearby);
+    const labelByFor = getLabelByFor(element);
+    const dataLabel = getDataAttributeLabelText(element);
+    const ariaLabel = getAriaLabelText(element);
+    const ownText = getElementText(element);
+    const nearbyText = includeNearby ? getNearbyText(element) : "";
+    const classText = String(element.className || "");
+    const attrText = [
+      element.getAttribute?.("aria-label"),
+      element.getAttribute?.("title"),
+      element.getAttribute?.("placeholder"),
+      element.getAttribute?.("name"),
+      element.getAttribute?.("id")
+    ].filter(Boolean).join(" ");
+
+    return compactText([labelByFor, dataLabel, ariaLabel, ownText, nearbyText, classText, attrText].join(" "));
+  }
+
+  function isManualUploadCandidate(element) {
+    if (!element || !(element instanceof Element)) {
+      return false;
+    }
+    if (element.closest(`#${PANEL_ID},#${FLOAT_ID}`)) {
+      return false;
+    }
+    if (element instanceof HTMLInputElement && element.type === "file") {
+      return true;
+    }
+    if (!isVisible(element)) {
+      return false;
+    }
+
+    const directText = getManualUploadCandidateText(element);
+    if (MANUAL_UPLOAD_TEXT_PATTERN.test(directText)) {
+      return true;
+    }
+
+    const classText = String(element.className || "");
+    return MANUAL_UPLOAD_CLASS_PATTERN.test(classText) &&
+      MANUAL_UPLOAD_TEXT_PATTERN.test(getManualUploadCandidateText(element, { includeNearby: true }));
+  }
+
+  function resolveManualUploadMarkTarget(element) {
+    if (!element || !(element instanceof Element)) {
+      return null;
+    }
+    if (isVisible(element)) {
+      return element;
+    }
+    if (element instanceof HTMLInputElement && element.id) {
+      const label = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+      if (label && isVisible(label)) {
+        return label;
+      }
+    }
+
+    let current = element.parentElement;
+    while (current && current !== document.body && current !== document.documentElement) {
+      if (current.closest(`#${PANEL_ID},#${FLOAT_ID}`)) {
+        return null;
+      }
+      if (isVisible(current) && MANUAL_UPLOAD_TEXT_PATTERN.test(getManualUploadCandidateText(current, { includeNearby: true }))) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+
+    return null;
+  }
+
+  function markManualUploadFields(root = document) {
+    const targets = new Map();
+    const elements = Array.from(root.querySelectorAll(MANUAL_UPLOAD_SELECTOR));
+
+    for (const element of elements) {
+      if (!isManualUploadCandidate(element)) {
+        continue;
+      }
+
+      const markTarget = resolveManualUploadMarkTarget(element);
+      if (!markTarget) {
+        continue;
+      }
+
+      const fieldId = getOrCreateFieldId(markTarget);
+      if (!targets.has(fieldId)) {
+        targets.set(fieldId, {
+          element: markTarget,
+          text: getManualUploadCandidateText(element, { includeNearby: true }) ||
+            getManualUploadCandidateText(markTarget, { includeNearby: true })
+        });
+      }
+    }
+
+    for (const item of targets.values()) {
+      const text = normalizeText(item.text, 80);
+      markElement(item.element, "uncertain", text ? `需要手动上传: ${text}` : "需要手动上传文件");
+    }
+
+    return targets.size;
+  }
+
   function clearMarks() {
     document.querySelectorAll(`[${MARK_ATTR}]`).forEach((element) => {
       element.removeAttribute(MARK_ATTR);
@@ -2671,7 +2793,8 @@
       skipped,
       pending: Number(summary?.pending ?? skipped + failed),
       total: Number(summary?.total || 0),
-      message: normalizeText(summary?.message || "", 160),
+      manualUploadCount: Number(summary?.manualUploadCount || 0),
+      message: normalizeText(summary?.message || "", 220),
       aiUsage: sanitizeAutofillAiUsage(summary?.aiUsage || getAutofillAiSnapshot())
     };
     renderFloatingStatus();
@@ -2719,11 +2842,15 @@
 
     const summary = autofillSummary || {};
     const modeBadge = getAutofillCompletionBadgeText(summary.aiUsage || autofillAiState);
+    const manualUploadCount = Number(summary.manualUploadCount || 0);
     if (title) {
       title.textContent = "填写完成";
     }
     if (detail) {
-      detail.textContent = summary.message || "请直接在页面上检查绿色已填写和橙色待处理标记。";
+      const baseMessage = summary.message || "请直接在页面上检查绿色已填写和橙色待处理标记。";
+      detail.textContent = manualUploadCount > 0
+        ? `${baseMessage} 另有 ${manualUploadCount} 个上传项需要手动选择文件。`
+        : baseMessage;
     }
     if (progress) {
       progress.hidden = true;
@@ -2733,6 +2860,7 @@
       chips.innerHTML = `
         <div class="arf-float-chip is-ok"><strong>${summary.filled || 0}</strong>已填写</div>
         <div class="arf-float-chip is-warn"><strong>${summary.pending || 0}</strong>待处理</div>
+        ${manualUploadCount > 0 ? `<div class="arf-float-chip is-warn"><strong>${manualUploadCount}</strong>需上传</div>` : ""}
       `;
     }
     if (aiFlag) {
@@ -5107,7 +5235,8 @@
       skipped: Number(summary?.skipped || 0),
       pending: Number(summary?.pending ?? Number(summary?.failed || 0) + Number(summary?.skipped || 0)),
       total: Number(summary?.total || 0),
-      message: normalizeText(summary?.message || "", 160),
+      manualUploadCount: Number(summary?.manualUploadCount || 0),
+      message: normalizeText(summary?.message || "", 220),
       aiUsage: sanitizeAutofillAiUsage(summary?.aiUsage || getAutofillAiSnapshot())
     };
     lastAutofillDebug.aiUsage = sanitizeAutofillAiUsage(summary?.aiUsage || lastAutofillDebug.aiUsage || getAutofillAiSnapshot());
@@ -5485,12 +5614,15 @@
       if (!plan || autoFillIds.size === 0) {
         setProfilePanelStatus("本页没有自动填写项，橙色字段需要手动处理。可以打开资料面板查看和复制资料。", true);
         const skippedCount = await markDeferredPlanCandidates(plan, autoFillIds);
+        const manualUploadCount = markManualUploadFields();
         const summary = {
           attempted: 0,
           filled: 0,
           failed: 0,
           skipped: skippedCount || plan?.candidates?.length || 0,
-          total: plan?.candidates?.length || 0,
+          pending: (skippedCount || plan?.candidates?.length || 0) + manualUploadCount,
+          total: (plan?.candidates?.length || 0) + manualUploadCount,
+          manualUploadCount,
           message: "没有找到可自动填写的字段，橙色标记需要手动处理。",
           aiUsage
         };
@@ -5597,13 +5729,15 @@
     const filledCount = results.filter((result) => result.ok).length;
     const failedCount = results.length - filledCount;
     const skippedCount = await markDeferredPlanCandidates(plan, autoFillSet);
+    const manualUploadCount = markManualUploadFields();
     const summary = {
       attempted: results.length,
       filled: filledCount,
       failed: failedCount,
       skipped: skippedCount,
-      pending: failedCount + skippedCount,
-      total: plan?.candidates?.length || results.length,
+      pending: failedCount + skippedCount + manualUploadCount,
+      total: (plan?.candidates?.length || results.length) + manualUploadCount,
+      manualUploadCount,
       message: `页面已标记：绿色为已填写，橙色为待处理。`,
       aiUsage: getAutofillAiSnapshot()
     };
